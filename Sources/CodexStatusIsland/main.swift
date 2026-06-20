@@ -92,8 +92,18 @@ final class CodexStatusMonitor {
 
     private func sessionStatus(for url: URL, fallbackName: String) -> MonitoredSession? {
         let sessionName = cachedTitles[url.path].flatMap { $0.isEmpty ? nil : $0 } ?? fallbackName
+        let events = recentSessionEvents(at: url, limit: 120_000)
 
-        for event in recentSessionEvents(at: url, limit: 120_000).reversed() {
+        if hasPendingApproval(in: events) {
+            return MonitoredSession(
+                id: url.path,
+                name: sessionName,
+                status: .needsApproval(reason: sessionName),
+                completionKey: nil
+            )
+        }
+
+        for event in events.reversed() {
             if event.isAbortedSignal {
                 return nil
             }
@@ -163,6 +173,22 @@ final class CodexStatusMonitor {
         }
 
         return nil
+    }
+
+    private func hasPendingApproval(in events: [SessionEvent]) -> Bool {
+        guard let requestIndex = events.lastIndex(where: {
+            $0.isApprovalRequest && $0.age < approvalWindow
+        }) else {
+            return false
+        }
+
+        for event in events[events.index(after: requestIndex)...] {
+            if event.isCompletionSignal || event.isAbortedSignal || event.isApprovalResolution {
+                return false
+            }
+        }
+
+        return true
     }
 
     private func recentSessionEvents(at url: URL, limit: Int) -> [SessionEvent] {
@@ -344,15 +370,42 @@ struct SessionEvent {
 
     var isApprovalRequest: Bool {
         guard kind == "response_item",
-              payloadType == "function_call",
-              let arguments = payload?["arguments"] as? String else {
+              payloadType == "function_call" || payloadType == "custom_tool_call" else {
             return false
         }
 
-        let normalized = arguments.lowercased()
+        let requestText = (payload?["arguments"] as? String)
+            ?? (payload?["input"] as? String)
+            ?? ""
+        let normalized = requestText.lowercased()
         return normalized.contains("\"sandbox_permissions\"")
             || normalized.contains("require_escalated")
             || normalized.contains("\"approval_policy\"")
+            || normalized.contains("\"justification\"")
+    }
+
+    var isApprovalResolution: Bool {
+        guard kind == "response_item",
+              payloadType == "function_call_output" || payloadType == "custom_tool_call_output" else {
+            return false
+        }
+
+        let normalized = outputText.lowercased()
+        return normalized.contains("script completed")
+            || normalized.contains("script failed")
+            || normalized.contains("rejected by user")
+    }
+
+    private var outputText: String {
+        if let output = payload?["output"] as? String {
+            return output
+        }
+
+        if let blocks = payload?["output"] as? [[String: Any]] {
+            return blocks.compactMap { $0["text"] as? String }.joined(separator: "\n")
+        }
+
+        return ""
     }
 
     init?(jsonLine: String) {
