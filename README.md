@@ -44,5 +44,5 @@ App 只按 Codex 会话活动状态检测，读取本机 `~/.codex/sessions` 下
 <img width="566" height="162" alt="image" src="https://github.com/user-attachments/assets/0433a471-c31a-4c3d-984c-7776cb4391f7" />
 <img width="614" height="152" alt="image" src="https://github.com/user-attachments/assets/19e8d7eb-cee7-4b44-bdd4-294131e3271f" />
 <img width="438" height="58" alt="image" src="https://github.com/user-attachments/assets/534bdf31-ab59-4fe8-bebc-c60fcfa82b56" />
-<img width="1502" height="1026" alt="image" src="https://github.com/user-attachments/assets/ebe3d61b-4056-4b0e-a447-c1f8e129a01a" />
+<img width="357" height="190" alt="image" src="https://github.com/user-attachments/assets/4ddd79e8-0aae-4de2-963f-fd759bab5927" />
 
