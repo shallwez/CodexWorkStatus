@@ -67,43 +67,92 @@ enum IslandPosition: String, CaseIterable {
     }
 }
 
+struct MonitoredSession {
+    let id: String
+    let name: String
+    let status: CodexStatus
+    let completionKey: String?
+}
+
 final class CodexStatusMonitor {
     private let homeDirectory = FileManager.default.homeDirectoryForCurrentUser
     private let activeTurnWindow: TimeInterval = 60 * 60
     private let recentlyCompletedWindow: TimeInterval = 45
     private let approvalWindow: TimeInterval = 15 * 60
+    private let maximumSessionCount = 20
+    private var cachedTitles: [String: String] = [:]
+    private var titlesLoadedAt = Date.distantPast
 
-    func currentStatus() -> CodexStatus? {
-        latestSessionStatus()
+    func currentSessions() -> [MonitoredSession] {
+        refreshSessionTitlesIfNeeded()
+
+        return recentSessionFiles()
+            .compactMap { sessionStatus(for: $0.url, fallbackName: $0.fallbackName) }
     }
 
-    private func latestSessionStatus() -> CodexStatus? {
-        for event in recentSessionEvents(limit: 120_000).reversed() {
+    private func sessionStatus(for url: URL, fallbackName: String) -> MonitoredSession? {
+        let sessionName = cachedTitles[url.path].flatMap { $0.isEmpty ? nil : $0 } ?? fallbackName
+
+        for event in recentSessionEvents(at: url, limit: 120_000).reversed() {
+            if event.isAbortedSignal {
+                return nil
+            }
+
             if event.isCompletionSignal {
                 if event.age < recentlyCompletedWindow {
-                    return .complete(reason: "刚刚完成")
+                    return MonitoredSession(
+                        id: url.path,
+                        name: sessionName,
+                        status: .complete(reason: sessionName),
+                        completionKey: "\(url.path)#\(event.timestamp.timeIntervalSince1970)"
+                    )
                 }
                 return nil
             }
 
             if event.isApprovalRequest, event.age < approvalWindow {
-                return .needsApproval(reason: "需要你批准权限")
+                return MonitoredSession(
+                    id: url.path,
+                    name: sessionName,
+                    status: .needsApproval(reason: sessionName),
+                    completionKey: nil
+                )
             }
 
             if event.isWorkingSignal, event.age < activeTurnWindow {
-                return .working(reason: "会话正在运行")
+                return MonitoredSession(
+                    id: url.path,
+                    name: sessionName,
+                    status: .working(reason: sessionName),
+                    completionKey: nil
+                )
             }
 
             if event.kind == "user_message", event.age < activeTurnWindow {
-                return .working(reason: "会话正在运行")
+                return MonitoredSession(
+                    id: url.path,
+                    name: sessionName,
+                    status: .working(reason: sessionName),
+                    completionKey: nil
+                )
             }
 
             if event.kind == "turn_context", event.age < activeTurnWindow {
-                return .working(reason: "会话正在运行")
+                return MonitoredSession(
+                    id: url.path,
+                    name: sessionName,
+                    status: .working(reason: sessionName),
+                    completionKey: nil
+                )
             }
 
             if event.kind == "response_item", event.age < activeTurnWindow {
-                return .working(reason: "会话正在运行")
+                return MonitoredSession(
+                    id: url.path,
+                    name: sessionName,
+                    status: .working(reason: sessionName),
+                    completionKey: nil
+                )
             }
 
             if event.kind == "event_msg", event.age < activeTurnWindow {
@@ -116,12 +165,8 @@ final class CodexStatusMonitor {
         return nil
     }
 
-    private func recentSessionEvents(limit: Int) -> [SessionEvent] {
-        guard let latest = latestSessionFile() else {
-            return []
-        }
-
-        guard let handle = try? FileHandle(forReadingFrom: latest) else {
+    private func recentSessionEvents(at url: URL, limit: Int) -> [SessionEvent] {
+        guard let handle = try? FileHandle(forReadingFrom: url) else {
             return []
         }
 
@@ -140,17 +185,17 @@ final class CodexStatusMonitor {
             .compactMap { SessionEvent(jsonLine: String($0)) }
     }
 
-    private func latestSessionFile() -> URL? {
+    private func recentSessionFiles() -> [(url: URL, fallbackName: String)] {
         let sessionsDirectory = homeDirectory.appendingPathComponent(".codex/sessions")
         guard let enumerator = FileManager.default.enumerator(
             at: sessionsDirectory,
             includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey],
             options: [.skipsHiddenFiles]
         ) else {
-            return nil
+            return []
         }
 
-        var candidate: (url: URL, date: Date)?
+        var candidates: [(url: URL, date: Date, fallbackName: String)] = []
         for case let url as URL in enumerator {
             guard url.pathExtension == "jsonl",
                   let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .isRegularFileKey]),
@@ -159,19 +204,82 @@ final class CodexStatusMonitor {
                 continue
             }
 
-            if candidate == nil || modified > candidate!.date {
-                candidate = (url, modified)
+            guard Date().timeIntervalSince(modified) < activeTurnWindow else {
+                continue
             }
+
+            let fallbackName = sessionFallbackName(from: url)
+            candidates.append((url, modified, fallbackName))
         }
 
-        return candidate?.url
+        return candidates
+            .sorted { $0.date > $1.date }
+            .prefix(maximumSessionCount)
+            .map { ($0.url, $0.fallbackName) }
     }
 
+    private func sessionFallbackName(from url: URL) -> String {
+        let parentName = url.deletingLastPathComponent().lastPathComponent
+        return parentName.isEmpty ? "Codex 会话" : "会话 \(parentName)"
+    }
+
+    private func refreshSessionTitlesIfNeeded() {
+        guard Date().timeIntervalSince(titlesLoadedAt) >= 10 else {
+            return
+        }
+        titlesLoadedAt = Date()
+
+        let codexDirectory = homeDirectory.appendingPathComponent(".codex")
+        guard let files = try? FileManager.default.contentsOfDirectory(
+            at: codexDirectory,
+            includingPropertiesForKeys: nil
+        ),
+        let database = files
+            .filter({ $0.lastPathComponent.hasPrefix("state_") && $0.pathExtension == "sqlite" })
+            .sorted(by: { $0.lastPathComponent > $1.lastPathComponent })
+            .first else {
+            return
+        }
+
+        let task = Process()
+        let output = Pipe()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/sqlite3")
+        task.arguments = [
+            "-json",
+            database.path,
+            "SELECT rollout_path, title FROM threads "
+                + "WHERE archived = 0 "
+                + "AND updated_at >= CAST(strftime('%s', 'now') AS INTEGER) - 7200;"
+        ]
+        task.standardOutput = output
+        task.standardError = Pipe()
+
+        do {
+            try task.run()
+            let data = output.fileHandleForReading.readDataToEndOfFile()
+            task.waitUntilExit()
+            guard task.terminationStatus == 0,
+                  let rows = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+                return
+            }
+
+            cachedTitles = Dictionary(uniqueKeysWithValues: rows.compactMap { row in
+                guard let path = row["rollout_path"] as? String,
+                      let title = row["title"] as? String else {
+                    return nil
+                }
+                return (path, title)
+            })
+        } catch {
+            return
+        }
+    }
 }
 
 struct SessionEvent {
     let kind: String
     let age: TimeInterval
+    let timestamp: Date
     let payload: [String: Any]?
 
     var payloadType: String? {
@@ -200,6 +308,10 @@ struct SessionEvent {
         }
 
         return false
+    }
+
+    var isAbortedSignal: Bool {
+        kind == "event_msg" && payloadType == "turn_aborted"
     }
 
     var isWorkingSignal: Bool {
@@ -254,6 +366,7 @@ struct SessionEvent {
 
         self.kind = kind
         self.age = Date().timeIntervalSince(date)
+        self.timestamp = date
         self.payload = object["payload"] as? [String: Any]
     }
 }
@@ -498,6 +611,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }()
     private var timer: Timer?
     private var lastStatus: CodexStatus?
+    private var displayedSessionIndex = 0
+    private var announcedCompletionKeys = Set<String>()
+    private var didInitialSessionScan = false
+
+    private func playCompletionSound() {
+        if NSSound(named: NSSound.Name("Hero"))?.play() != true {
+            NSSound.beep()
+        }
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -669,21 +791,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func updateStatus() {
-        guard let status = monitor.currentStatus() else {
+        let sessions = monitor.currentSessions()
+        let completionKeys = Set(sessions.compactMap(\.completionKey))
+
+        if didInitialSessionScan {
+            if !completionKeys.subtracting(announcedCompletionKeys).isEmpty {
+                playCompletionSound()
+            }
+        } else {
+            didInitialSessionScan = true
+        }
+        announcedCompletionKeys.formUnion(completionKeys)
+
+        guard !sessions.isEmpty else {
             if lastStatus != nil {
                 panel?.orderOut(nil)
                 lastStatus = nil
             }
+            displayedSessionIndex = 0
             updateStatusItem(nil)
             updatePositionMenuItems()
             return
         }
 
+        displayedSessionIndex %= sessions.count
+        let currentIndex = displayedSessionIndex
+        let currentSession = sessions[currentIndex]
+        let status = currentSession.status
+        displayedSessionIndex = (displayedSessionIndex + 1) % sessions.count
+
         if status != lastStatus {
             islandView.apply(status)
             lastStatus = status
         }
-        updateStatusItem(status)
+        updateStatusItem(status, sessionPosition: currentIndex + 1, sessionCount: sessions.count)
         updatePositionMenuItems()
         if currentIslandPosition() == .hidden {
             panel?.orderOut(nil)
@@ -693,7 +834,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel?.orderFrontRegardless()
     }
 
-    private func updateStatusItem(_ status: CodexStatus?) {
+    private func updateStatusItem(
+        _ status: CodexStatus?,
+        sessionPosition: Int = 0,
+        sessionCount: Int = 0
+    ) {
         guard let button = statusItem?.button else {
             return
         }
@@ -706,7 +851,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         button.title = status.menuIcon
-        statusMenuItem.title = "\(status.title)：\(status.detail)"
+        let position = sessionCount > 1 ? "[\(sessionPosition)/\(sessionCount)] " : ""
+        statusMenuItem.title = "\(position)\(status.title)：\(status.detail)"
         updateLaunchAtLoginMenuItem()
     }
 }
