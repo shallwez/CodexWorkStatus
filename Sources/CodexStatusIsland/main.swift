@@ -47,6 +47,26 @@ enum CodexStatus: Equatable {
     }
 }
 
+enum IslandPosition: String, CaseIterable {
+    case topCenter
+    case bottomRight
+    case bottomLeft
+    case hidden
+
+    var title: String {
+        switch self {
+        case .topCenter:
+            return "顶部居中"
+        case .bottomRight:
+            return "右下角"
+        case .bottomLeft:
+            return "左下角"
+        case .hidden:
+            return "不显示"
+        }
+    }
+}
+
 final class CodexStatusMonitor {
     private let homeDirectory = FileManager.default.homeDirectoryForCurrentUser
     private let activeTurnWindow: TimeInterval = 60 * 60
@@ -455,13 +475,22 @@ final class IslandView: NSView {
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    private let islandSize = CGSize(width: 210, height: 58)
+    private let positionDefaultsKey = "islandPosition"
     private let monitor = CodexStatusMonitor()
     private let launchAgentInstaller = LaunchAgentInstaller()
-    private let islandView = IslandView(frame: CGRect(x: 0, y: 0, width: 250, height: 58))
+    private lazy var islandView = IslandView(frame: CGRect(origin: .zero, size: islandSize))
     private var panel: NSPanel?
     private var statusItem: NSStatusItem?
     private let statusMenu = NSMenu()
     private let statusMenuItem = NSMenuItem(title: "正在检测 Codex", action: nil, keyEquivalent: "")
+    private let positionMenu = NSMenu()
+    private lazy var positionMenuItems: [NSMenuItem] = IslandPosition.allCases.map { position in
+        let item = NSMenuItem(title: position.title, action: #selector(selectIslandPosition(_:)), keyEquivalent: "")
+        item.target = self
+        item.representedObject = position.rawValue
+        return item
+    }
     private lazy var launchAtLoginMenuItem: NSMenuItem = {
         let item = NSMenuItem(title: "开机启动", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
         item.target = self
@@ -493,6 +522,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         statusMenu.addItem(statusMenuItem)
         statusMenu.addItem(.separator())
+        let positionItem = NSMenuItem(title: "显示位置", action: nil, keyEquivalent: "")
+        for item in positionMenuItems {
+            positionMenu.addItem(item)
+        }
+        positionItem.submenu = positionMenu
+        statusMenu.addItem(positionItem)
+        statusMenu.addItem(.separator())
         statusMenu.addItem(launchAtLoginMenuItem)
         statusMenu.addItem(.separator())
         statusMenu.addItem(NSMenuItem(
@@ -505,6 +541,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         statusItem = item
         updateLaunchAtLoginMenuItem()
+        updatePositionMenuItems()
     }
 
     @objc private func quit() {
@@ -525,9 +562,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         launchAtLoginMenuItem.state = launchAgentInstaller.isInstalled() ? .on : .off
     }
 
+    @objc private func selectIslandPosition(_ sender: NSMenuItem) {
+        guard let rawValue = sender.representedObject as? String,
+              let position = IslandPosition(rawValue: rawValue) else {
+            return
+        }
+
+        UserDefaults.standard.set(position.rawValue, forKey: positionDefaultsKey)
+        updatePositionMenuItems()
+        if position == .hidden {
+            panel?.orderOut(nil)
+        } else {
+            positionPanel()
+            if lastStatus != nil {
+                panel?.orderFrontRegardless()
+            }
+        }
+    }
+
+    private func updatePositionMenuItems() {
+        let selectedPosition = currentIslandPosition()
+        for item in positionMenuItems {
+            item.state = item.representedObject as? String == selectedPosition.rawValue ? .on : .off
+        }
+    }
+
+    private func currentIslandPosition() -> IslandPosition {
+        guard let rawValue = UserDefaults.standard.string(forKey: positionDefaultsKey),
+              let position = IslandPosition(rawValue: rawValue) else {
+            return .topCenter
+        }
+
+        return position
+    }
+
     private func createPanel() {
         let panel = NSPanel(
-            contentRect: CGRect(x: 0, y: 0, width: 250, height: 58),
+            contentRect: CGRect(origin: .zero, size: islandSize),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -563,9 +634,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         let frame = screen.frame
-        let x = frame.midX - panel.frame.width / 2
-        let y = frame.maxY - panel.frame.height - 2
-        panel.setFrameOrigin(CGPoint(x: x, y: y))
+        let origin: CGPoint
+
+        switch currentIslandPosition() {
+        case .topCenter:
+            origin = CGPoint(
+                x: frame.midX - panel.frame.width / 2,
+                y: frame.maxY - panel.frame.height - 2
+            )
+        case .bottomRight:
+            origin = CGPoint(
+                x: frame.maxX - panel.frame.width,
+                y: frame.minY + 20
+            )
+        case .bottomLeft:
+            origin = CGPoint(
+                x: frame.minX,
+                y: frame.minY + 20
+            )
+        case .hidden:
+            return
+        }
+
+        panel.setFrameOrigin(origin)
     }
 
     private func screenForIsland() -> NSScreen? {
@@ -584,6 +675,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 lastStatus = nil
             }
             updateStatusItem(nil)
+            updatePositionMenuItems()
             return
         }
 
@@ -592,6 +684,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             lastStatus = status
         }
         updateStatusItem(status)
+        updatePositionMenuItems()
+        if currentIslandPosition() == .hidden {
+            panel?.orderOut(nil)
+            return
+        }
         positionPanel()
         panel?.orderFrontRegardless()
     }
