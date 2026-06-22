@@ -1,25 +1,30 @@
 import AppKit
 import Foundation
 
+enum AgentKind: String, Equatable {
+    case codex = "Codex"
+    case claude = "Claude Code"
+}
+
 enum CodexStatus: Equatable {
-    case working(reason: String)
-    case complete(reason: String)
-    case needsApproval(reason: String)
+    case working(agent: AgentKind, reason: String)
+    case complete(agent: AgentKind, reason: String)
+    case needsApproval(agent: AgentKind, reason: String)
 
     var title: String {
         switch self {
-        case .working:
-            return "Codex 正在工作"
-        case .complete:
-            return "Codex 工作完成"
-        case .needsApproval:
-            return "Codex 等待批准"
+        case .working(let agent, _):
+            return "\(agent.rawValue) 正在工作"
+        case .complete(let agent, _):
+            return "\(agent.rawValue) 工作完成"
+        case .needsApproval(let agent, _):
+            return "\(agent.rawValue) 等待批准"
         }
     }
 
     var detail: String {
         switch self {
-        case .working(let reason), .complete(let reason), .needsApproval(let reason):
+        case .working(_, let reason), .complete(_, let reason), .needsApproval(_, let reason):
             return reason
         }
     }
@@ -91,14 +96,16 @@ final class CodexStatusMonitor {
     }
 
     private func sessionStatus(for url: URL, fallbackName: String) -> MonitoredSession? {
-        let sessionName = cachedTitles[url.path].flatMap { $0.isEmpty ? nil : $0 } ?? fallbackName
-        let events = recentSessionEvents(at: url, limit: 120_000)
+        let events = recentSessionEvents(at: url, limit: 500_000)
+        let sessionName = events.reversed().compactMap(\.userQuestion).first
+            ?? cachedTitles[url.path].flatMap { $0.isEmpty ? nil : $0 }
+            ?? fallbackName
 
         if hasPendingApproval(in: events) {
             return MonitoredSession(
                 id: url.path,
                 name: sessionName,
-                status: .needsApproval(reason: sessionName),
+                status: .needsApproval(agent: .codex, reason: sessionName),
                 completionKey: nil
             )
         }
@@ -113,7 +120,7 @@ final class CodexStatusMonitor {
                     return MonitoredSession(
                         id: url.path,
                         name: sessionName,
-                        status: .complete(reason: sessionName),
+                        status: .complete(agent: .codex, reason: sessionName),
                         completionKey: "\(url.path)#\(event.timestamp.timeIntervalSince1970)"
                     )
                 }
@@ -124,7 +131,7 @@ final class CodexStatusMonitor {
                 return MonitoredSession(
                     id: url.path,
                     name: sessionName,
-                    status: .needsApproval(reason: sessionName),
+                    status: .needsApproval(agent: .codex, reason: sessionName),
                     completionKey: nil
                 )
             }
@@ -133,7 +140,7 @@ final class CodexStatusMonitor {
                 return MonitoredSession(
                     id: url.path,
                     name: sessionName,
-                    status: .working(reason: sessionName),
+                    status: .working(agent: .codex, reason: sessionName),
                     completionKey: nil
                 )
             }
@@ -142,7 +149,7 @@ final class CodexStatusMonitor {
                 return MonitoredSession(
                     id: url.path,
                     name: sessionName,
-                    status: .working(reason: sessionName),
+                    status: .working(agent: .codex, reason: sessionName),
                     completionKey: nil
                 )
             }
@@ -151,7 +158,7 @@ final class CodexStatusMonitor {
                 return MonitoredSession(
                     id: url.path,
                     name: sessionName,
-                    status: .working(reason: sessionName),
+                    status: .working(agent: .codex, reason: sessionName),
                     completionKey: nil
                 )
             }
@@ -160,7 +167,7 @@ final class CodexStatusMonitor {
                 return MonitoredSession(
                     id: url.path,
                     name: sessionName,
-                    status: .working(reason: sessionName),
+                    status: .working(agent: .codex, reason: sessionName),
                     completionKey: nil
                 )
             }
@@ -316,6 +323,23 @@ struct SessionEvent {
         payload?["phase"] as? String
     }
 
+    var userQuestion: String? {
+        guard kind == "response_item",
+              payloadType == "message",
+              payload?["role"] as? String == "user",
+              let blocks = payload?["content"] as? [[String: Any]] else {
+            return nil
+        }
+
+        let rawText = blocks.compactMap { block -> String? in
+            let type = block["type"] as? String
+            guard type == "input_text" || type == "text" else { return nil }
+            return block["text"] as? String
+        }.joined(separator: "\n")
+
+        return cleanedUserQuestion(rawText, requestMarker: "## My request for Codex:")
+    }
+
     var isCompletionSignal: Bool {
         if kind == "event_msg", payloadType == "task_complete" {
             return true
@@ -422,6 +446,335 @@ struct SessionEvent {
         self.timestamp = date
         self.payload = object["payload"] as? [String: Any]
     }
+}
+
+final class ClaudeStatusMonitor {
+    private let homeDirectory = FileManager.default.homeDirectoryForCurrentUser
+    private let activeTurnWindow: TimeInterval = 60 * 60
+    private let recentlyCompletedWindow: TimeInterval = 45
+    private let coalescingWindow: TimeInterval = 60
+    private let approvalWindow: TimeInterval = 15 * 60
+    private let maximumSessionCount = 20
+
+    func currentSessions() -> [MonitoredSession] {
+        recentSessionFiles().compactMap { sessionStatus(for: $0) }
+    }
+
+    private func sessionStatus(for url: URL) -> MonitoredSession? {
+        let events = recentSessionEvents(at: url, limit: 300_000)
+        let sessionName = events.reversed().compactMap(\.userQuestion).first
+            ?? events.reversed().compactMap(\.aiTitle).first
+            ?? events.reversed().compactMap(\.projectName).first
+            ?? "Claude Code 会话"
+
+        if hasPendingApproval(in: events) {
+            return MonitoredSession(
+                id: "claude:\(url.path)",
+                name: sessionName,
+                status: .needsApproval(agent: .claude, reason: sessionName),
+                completionKey: nil
+            )
+        }
+
+        for event in events.reversed() {
+            guard event.age < activeTurnWindow else {
+                continue
+            }
+
+            if event.isInterruptedSignal {
+                return nil
+            }
+
+            if event.isCompletionSignal {
+                if event.needsCoalescingGrace, event.age < coalescingWindow {
+                    return MonitoredSession(
+                        id: "claude:\(url.path)",
+                        name: sessionName,
+                        status: .working(agent: .claude, reason: sessionName),
+                        completionKey: nil
+                    )
+                }
+
+                let completionRetention = recentlyCompletedWindow
+                    + (event.needsCoalescingGrace ? coalescingWindow : 0)
+                guard event.age < completionRetention,
+                      let timestamp = event.timestamp else {
+                    return nil
+                }
+
+                return MonitoredSession(
+                    id: "claude:\(url.path)",
+                    name: sessionName,
+                    status: .complete(agent: .claude, reason: sessionName),
+                    completionKey: "claude:\(url.path)#\(timestamp.timeIntervalSince1970)"
+                )
+            }
+
+            if event.isWorkingSignal {
+                return MonitoredSession(
+                    id: "claude:\(url.path)",
+                    name: sessionName,
+                    status: .working(agent: .claude, reason: sessionName),
+                    completionKey: nil
+                )
+            }
+        }
+
+        return nil
+    }
+
+    private func hasPendingApproval(in events: [ClaudeSessionEvent]) -> Bool {
+        var unresolvedTools: [String: (name: String, event: ClaudeSessionEvent)] = [:]
+
+        for event in events {
+            if event.isCompletionSignal {
+                unresolvedTools.removeAll()
+            }
+
+            for resultID in event.toolResultIDs {
+                unresolvedTools.removeValue(forKey: resultID)
+            }
+
+            for tool in event.toolUses {
+                unresolvedTools[tool.id] = (tool.name, event)
+            }
+        }
+
+        return unresolvedTools.values.contains { tool in
+            tool.event.age < approvalWindow && toolMayRequireApproval(tool.name)
+        }
+    }
+
+    private func toolMayRequireApproval(_ name: String) -> Bool {
+        let approvalTools = [
+            "Bash",
+            "Edit",
+            "Write",
+            "NotebookEdit",
+            "WebFetch",
+            "WebSearch",
+            "ExitPlanMode",
+            "AskUserQuestion"
+        ]
+        return approvalTools.contains(name) || name.hasPrefix("mcp__")
+    }
+
+    private func recentSessionEvents(at url: URL, limit: Int) -> [ClaudeSessionEvent] {
+        guard let handle = try? FileHandle(forReadingFrom: url) else {
+            return []
+        }
+        defer { try? handle.close() }
+
+        let size = (try? handle.seekToEnd()) ?? 0
+        let offset = size > UInt64(limit) ? size - UInt64(limit) : 0
+        try? handle.seek(toOffset: offset)
+        let data = (try? handle.readToEnd()) ?? Data()
+        let text = String(data: data, encoding: .utf8) ?? ""
+
+        return text
+            .split(separator: "\n")
+            .compactMap { ClaudeSessionEvent(jsonLine: String($0)) }
+    }
+
+    private func recentSessionFiles() -> [URL] {
+        let projectsDirectory = homeDirectory.appendingPathComponent(".claude/projects")
+        guard let enumerator = FileManager.default.enumerator(
+            at: projectsDirectory,
+            includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return []
+        }
+
+        var candidates: [(url: URL, date: Date)] = []
+        for case let url as URL in enumerator {
+            guard url.pathExtension == "jsonl",
+                  !url.pathComponents.contains("subagents"),
+                  let values = try? url.resourceValues(
+                    forKeys: [.contentModificationDateKey, .isRegularFileKey]
+                  ),
+                  values.isRegularFile == true,
+                  let modified = values.contentModificationDate,
+                  Date().timeIntervalSince(modified) < activeTurnWindow else {
+                continue
+            }
+            candidates.append((url, modified))
+        }
+
+        return candidates
+            .sorted { $0.date > $1.date }
+            .prefix(maximumSessionCount)
+            .map(\.url)
+    }
+}
+
+struct ClaudeSessionEvent {
+    let kind: String
+    let timestamp: Date?
+    let message: [String: Any]?
+    let aiTitle: String?
+    let cwd: String?
+    let toolUseResult: String?
+
+    var age: TimeInterval {
+        guard let timestamp else { return .infinity }
+        return Date().timeIntervalSince(timestamp)
+    }
+
+    var projectName: String? {
+        guard let cwd, !cwd.isEmpty else { return nil }
+        return URL(fileURLWithPath: cwd).lastPathComponent
+    }
+
+    var userQuestion: String? {
+        guard kind == "user", !isInterruptedSignal else { return nil }
+
+        let rawText: String
+        if let content = message?["content"] as? String {
+            rawText = content
+        } else {
+            rawText = contentBlocks.compactMap { block -> String? in
+                guard block["type"] as? String == "text" else { return nil }
+                return block["text"] as? String
+            }.joined(separator: "\n")
+        }
+
+        return cleanedUserQuestion(rawText, requestMarker: nil)
+    }
+
+    private var contentBlocks: [[String: Any]] {
+        message?["content"] as? [[String: Any]] ?? []
+    }
+
+    private var stopReason: String? {
+        message?["stop_reason"] as? String
+    }
+
+    var toolUses: [(id: String, name: String)] {
+        contentBlocks.compactMap { block in
+            guard block["type"] as? String == "tool_use",
+                  let id = block["id"] as? String,
+                  let name = block["name"] as? String else {
+                return nil
+            }
+            return (id, name)
+        }
+    }
+
+    var toolResultIDs: [String] {
+        contentBlocks.compactMap { block in
+            guard block["type"] as? String == "tool_result" else {
+                return nil
+            }
+            return block["tool_use_id"] as? String
+        }
+    }
+
+    var isCompletionSignal: Bool {
+        kind == "assistant"
+            && stopReason == "end_turn"
+            && contentBlocks.contains { $0["type"] as? String == "text" }
+    }
+
+    var needsCoalescingGrace: Bool {
+        guard let usage = message?["usage"] as? [String: Any] else {
+            return false
+        }
+
+        let inputTokens = usage["input_tokens"] as? Int ?? 0
+        let cacheReadTokens = usage["cache_read_input_tokens"] as? Int ?? 0
+        let cacheCreationTokens = usage["cache_creation_input_tokens"] as? Int ?? 0
+        return inputTokens + cacheReadTokens + cacheCreationTokens >= 30_000
+    }
+
+    var isInterruptedSignal: Bool {
+        guard kind == "user" else { return false }
+
+        let blockText = contentBlocks.compactMap { block -> String? in
+            (block["text"] as? String) ?? (block["content"] as? String)
+        }.joined(separator: "\n")
+        let normalized = [toolUseResult, blockText]
+            .compactMap { $0 }
+            .joined(separator: "\n")
+            .lowercased()
+
+        return normalized.contains("request interrupted by user")
+            || normalized.contains("tool use was rejected")
+            || normalized.contains("user doesn't want to proceed with this tool use")
+    }
+
+    var isWorkingSignal: Bool {
+        if kind == "user" {
+            return !contentBlocks.isEmpty || message?["content"] is String
+        }
+
+        guard kind == "assistant" else {
+            return false
+        }
+
+        return stopReason == "tool_use"
+            || contentBlocks.contains {
+                let type = $0["type"] as? String
+                return type == "thinking" || type == "tool_use"
+            }
+    }
+
+    init?(jsonLine: String) {
+        guard let data = jsonLine.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let kind = object["type"] as? String else {
+            return nil
+        }
+
+        self.kind = kind
+        self.message = object["message"] as? [String: Any]
+        self.aiTitle = object["aiTitle"] as? String
+        self.cwd = object["cwd"] as? String
+        self.toolUseResult = object["toolUseResult"] as? String
+
+        if let timestampText = object["timestamp"] as? String {
+            self.timestamp = ISO8601DateFormatter.codex.date(from: timestampText)
+        } else {
+            self.timestamp = nil
+        }
+    }
+}
+
+private func cleanedUserQuestion(_ rawText: String, requestMarker: String?) -> String? {
+    var text = rawText
+
+    if let requestMarker,
+       let markerRange = text.range(of: requestMarker, options: .backwards) {
+        text = String(text[markerRange.upperBound...])
+    }
+
+    let tagPatterns = [
+        "<environment_context>[\\s\\S]*?</environment_context>",
+        "<ide_[^>]+>[\\s\\S]*?</ide_[^>]+>",
+        "<system-reminder>[\\s\\S]*?</system-reminder>",
+        "<image[^>]*>[\\s\\S]*?</image>"
+    ]
+    for pattern in tagPatterns {
+        text = text.replacingOccurrences(
+            of: pattern,
+            with: "",
+            options: .regularExpression
+        )
+    }
+
+    text = text
+        .split(whereSeparator: \.isNewline)
+        .map { $0.trimmingCharacters(in: .whitespaces) }
+        .filter { line in
+            !line.isEmpty
+                && !line.hasPrefix("# Files mentioned by the user:")
+                && !line.hasPrefix("## codex-clipboard-")
+                && !line.hasPrefix("## My request for")
+        }
+        .joined(separator: " ")
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+
+    return text.isEmpty ? nil : text
 }
 
 extension ISO8601DateFormatter {
@@ -644,12 +997,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let islandSize = CGSize(width: 210, height: 58)
     private let positionDefaultsKey = "islandPosition"
     private let monitor = CodexStatusMonitor()
+    private let claudeMonitor = ClaudeStatusMonitor()
     private let launchAgentInstaller = LaunchAgentInstaller()
     private lazy var islandView = IslandView(frame: CGRect(origin: .zero, size: islandSize))
     private var panel: NSPanel?
     private var statusItem: NSStatusItem?
     private let statusMenu = NSMenu()
-    private let statusMenuItem = NSMenuItem(title: "正在检测 Codex", action: nil, keyEquivalent: "")
+    private let statusMenuItem = NSMenuItem(title: "正在检测 AI 会话", action: nil, keyEquivalent: "")
     private let positionMenu = NSMenu()
     private lazy var positionMenuItems: [NSMenuItem] = IslandPosition.allCases.map { position in
         let item = NSMenuItem(title: position.title, action: #selector(selectIslandPosition(_:)), keyEquivalent: "")
@@ -844,7 +1198,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func updateStatus() {
-        let sessions = monitor.currentSessions()
+        let sessions = monitor.currentSessions() + claudeMonitor.currentSessions()
         let completionKeys = Set(sessions.compactMap(\.completionKey))
 
         if didInitialSessionScan {
@@ -898,7 +1252,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         guard let status else {
             button.title = "⚪️"
-            statusMenuItem.title = "Codex 没有会话活动"
+            statusMenuItem.title = "Codex 与 Claude Code 没有会话活动"
             updateLaunchAtLoginMenuItem()
             return
         }

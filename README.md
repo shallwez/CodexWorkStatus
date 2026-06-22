@@ -1,6 +1,6 @@
 # 红绿灯
 
-一款轻量的 macOS Codex 状态提醒工具。它在菜单栏显示当前状态，并用灵动岛样式的悬浮提示告诉你 Codex 是正在工作、已经完成，还是正在等待权限批准。
+一款轻量的 macOS Codex 与 Claude Code 状态提醒工具。它在菜单栏显示当前状态，并用灵动岛样式的悬浮提示告诉你 AI 会话是正在工作、已经完成，还是正在等待权限批准。
 
 > 本项目是非官方工具，与 OpenAI 无隶属或背书关系。
 <img width="582" height="172" alt="image" src="https://github.com/user-attachments/assets/f8ba93ea-4c76-484f-be53-05cfacf04d8a" />
@@ -18,6 +18,8 @@
 - 支持完全隐藏悬浮提示，仅保留菜单栏图标
 - 没有活动会话时自动隐藏悬浮提示
 - 支持开机启动
+- 同时监控 Codex 与 Claude Code 的多个独立会话并循环展示
+- 子标题显示当前会话最新一次用户提问
 - 原生 Swift + AppKit 实现，无第三方依赖
 - 仅在本机读取 Codex 会话记录，不上传数据
 
@@ -33,7 +35,9 @@
 ## 系统要求
 
 - macOS 13 Ventura 或更高版本
-- 已安装并使用过 Codex，且本机存在 `~/.codex/sessions` 会话目录
+- 已安装并使用过 Codex 或 Claude Code
+- Codex 会话目录：`~/.codex/sessions`
+- Claude Code 会话目录：`~/.claude/projects`
 
 从源码构建还需要 Xcode Command Line Tools（包含 Swift 5.9 或更高版本）。
 
@@ -84,11 +88,12 @@ swift run
 
 ## 工作原理
 
-红绿灯每 2 秒读取一次 `~/.codex/sessions` 中最近更新的 Codex JSONL 会话文件，并根据最新会话事件判断状态：
+红绿灯每 2 秒读取一次 `~/.codex/sessions` 和 `~/.claude/projects` 中最近更新的 JSONL 会话文件，并根据各会话的最新事件独立判断状态：
 
 - `task_started`、推理、工具调用、评论输出等事件判定为正在工作。
 - `task_complete` 或最终答复事件判定为工作完成。
 - 包含权限升级或审批参数的工具调用判定为等待批准。
+- Claude Code 的 `tool_use`、`tool_result` 和 `stop_reason` 用于判断工作、审批与完成状态。
 
 应用不会通过 Codex 常驻进程、SQLite 修改时间或普通日志推测状态，这可以减少“任务已经结束但仍显示正在工作”的误判。
 
@@ -121,5 +126,4 @@ swift run
 ```bash
 swift build
 ```
-
 
